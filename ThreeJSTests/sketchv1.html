@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Hand-Drawn Three.js (module imports, no external images)</title>
+  <style>
+    html,body{height:100%;margin:0;background:#111;overflow:hidden}
+    #hud{position:fixed;left:14px;bottom:12px;color:#ddd;font:12px system-ui;background:rgba(0,0,0,.35);
+         border:1px solid #333;padding:8px 10px;border-radius:8px}
+    canvas{display:block}
+  </style>
+  <!-- Use the same pattern your server already accepts -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.164.1/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.164.1/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="hud">Drag to orbit • Scroll to zoom • Hand-drawn post + hatch (no external images)</div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    // ---------- small helpers: procedural textures ----------
+    function canvasTex(draw, w=512, h=w){
+      const c=document.createElement('canvas'); c.width=w; c.height=h;
+      draw(c.getContext('2d'), w, h);
+      const t=new THREE.CanvasTexture(c);
+      t.wrapS=t.wrapT=THREE.RepeatWrapping;
+      t.minFilter=THREE.LinearMipmapLinearFilter;
+      t.magFilter=THREE.LinearFilter;
+      t.generateMipmaps=true;
+      return t;
+    }
+
+    const noiseTex = canvasTex((ctx,w,h)=>{
+      const img=ctx.createImageData(w,h);
+      for(let i=0;i<img.data.length;i+=4){
+        const v=Math.random()*255|0;
+        img.data[i]=img.data[i+1]=img.data[i+2]=v; img.data[i+3]=255;
+      }
+      ctx.putImageData(img,0,0);
+    },256);
+
+    const paperTex = canvasTex((ctx,w,h)=>{
+      ctx.fillStyle='#f6f4ee'; ctx.fillRect(0,0,w,h);
+      ctx.globalAlpha=0.12; ctx.strokeStyle='#000';
+      for(let i=0;i<600;i++){
+        const x=Math.random()*w, y=Math.random()*h;
+        const len=10+Math.random()*40, ang=Math.random()*Math.PI*2;
+        ctx.lineWidth=0.5+Math.random()*0.7;
+        ctx.beginPath(); ctx.moveTo(x,y);
+        ctx.lineTo(x+Math.cos(ang)*len, y+Math.sin(ang)*len); ctx.stroke();
+      }
+      const img=ctx.getImageData(0,0,w,h);
+      for(let y=0;y<h;y++) for(let x=0;x<w;x++){
+        const i=(y*w+x)*4;
+        const v=(Math.sin(x*0.21)+Math.sin(y*0.19)+Math.sin((x+y)*0.11))*6;
+        img.data[i]+=v; img.data[i+1]+=v; img.data[i+2]+=v;
+      }
+      ctx.putImageData(img,0,0);
+    });
+
+    // three rows (light/med/dense) – repeated horizontally
+    const hatchTex = canvasTex((ctx,w,h)=>{
+      ctx.fillStyle='#fff'; ctx.fillRect(0,0,w,h);
+      const rows=3, rowH=h/rows;
+      function row(r, step, cross){
+        ctx.save(); ctx.translate(0, r*rowH);
+        ctx.strokeStyle='#111'; ctx.lineWidth=1;
+        for(let x=-h; x<w+h; x+=step){ ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x+h,h); ctx.stroke(); }
+        if(cross){ for(let x=0; x<w+h; x+=step){ ctx.beginPath(); ctx.moveTo(x,h); ctx.lineTo(x-h,0); ctx.stroke(); } }
+        ctx.restore();
+      }
+      row(0,28,false); row(1,18,true); row(2,10,true);
+    }, 512, 384);
+
+    // ---------- renderer / scene / camera ----------
+    const renderer = new THREE.WebGLRenderer({ antialias:true, powerPreference:'high-performance' });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio,2));
+    renderer.setSize(innerWidth, innerHeight);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    document.body.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x101010);
+
+    const camera = new THREE.PerspectiveCamera(55, innerWidth/innerHeight, 0.1, 200);
+    camera.position.set(4,3.5,6);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+
+    scene.add(new THREE.HemisphereLight(0xffffff, 0x223344, 0.6));
+    const dir = new THREE.DirectionalLight(0xffffff, 0.9);
+    dir.position.set(2,3,1); scene.add(dir);
+
+    // ---------- hatch material ----------
+    const hatchMat = new THREE.ShaderMaterial({
+      uniforms:{
+        hatch:{value:hatchTex},
+        scale:{value:6.0},
+        inkTint:{value:new THREE.Color(0.09,0.09,0.09)},
+        time:{value:0},
+        lightDir:{value:new THREE.Vector3(0.4,0.7,0.55)}
+      },
+      vertexShader:/*glsl*/`
+        varying vec2 vUv; varying vec3 vN;
+        void main(){ vUv=uv; vN=normalize(normalMatrix*normal);
+          gl_Position = projectionMatrix * viewMatrix * modelMatrix * vec4(position,1.0);
+        }`,
+      fragmentShader:/*glsl*/`
+        precision highp float;
+        uniform sampler2D hatch; uniform float scale; uniform vec3 inkTint;
+        uniform float time; uniform vec3 lightDir;
+        varying vec2 vUv; varying vec3 vN;
+        void main(){
+          vec3 N=normalize(vN), L=normalize(lightDir);
+          float ndl = clamp(dot(N,L)*0.5+0.5, 0.0, 1.0);
+          float band = floor(ndl*3.0); float v=(band+0.5)/3.0;
+          vec2 suv = fract(vUv*scale + vec2(fract(time*0.07), fract(time*0.05))*0.01);
+          vec3 texel = texture(hatch, vec2(suv.x, v)).rgb;
+          vec3 base = mix(vec3(1.0), inkTint, 0.75);
+          gl_FragColor = vec4(base*texel, 1.0);
+        }`
+    });
+
+    // demo geometry
+    const ground = new THREE.Mesh(new THREE.PlaneGeometry(20,20).rotateX(-Math.PI/2), hatchMat);
+    scene.add(ground);
+    const box = new THREE.Mesh(new THREE.BoxGeometry(1,1,1), hatchMat); box.position.set(-1.2,0.5,0); scene.add(box);
+    const sphere = new THREE.Mesh(new THREE.SphereGeometry(0.7,32,16), hatchMat); sphere.position.set(1.3,0.7,0.5); scene.add(sphere);
+
+    // simple inverted-hull outlines
+    function addOutline(mesh, t=0.03, color=0x000000){
+      const o=mesh.clone();
+      o.material=new THREE.MeshBasicMaterial({color, side:THREE.BackSide});
+      o.scale.multiplyScalar(1+t);
+      mesh.add(o);
+    }
+    addOutline(box); addOutline(sphere);
+
+    // ---------- manual post-process (RT + full-screen quad) ----------
+    let rt = new THREE.WebGLRenderTarget(innerWidth, innerHeight, { depthBuffer:true, stencilBuffer:false });
+    const fsScene = new THREE.Scene();
+    const fsCam = new THREE.OrthographicCamera(-1,1,1,-1,0,1);
+
+    const postMat = new THREE.ShaderMaterial({
+      uniforms:{
+        tScene:{value:rt.texture},
+        tPaper:{value:paperTex},
+        tNoise:{value:noiseTex},
+        resolution:{value:new THREE.Vector2(innerWidth, innerHeight)},
+        outlineStrength:{value:1.05},
+        levels:{value:5.0},
+        wobbleAmp:{value:0.35},
+        wobbleFreq:{value:0.7},
+        paperMix:{value:0.25},
+        time:{value:0}
+      },
+      vertexShader:`void main(){ gl_Position = vec4(position,1.0); }`,
+      fragmentShader:/*glsl*/`
+        precision highp float;
+        uniform sampler2D tScene, tPaper, tNoise;
+        uniform vec2 resolution;
+        uniform float outlineStrength, levels, wobbleAmp, wobbleFreq, paperMix, time;
+
+        float luma(vec3 c){ return dot(c, vec3(0.299,0.587,0.114)); }
+
+        void main(){
+          vec2 uv = gl_FragCoord.xy / resolution;
+
+          vec2 n = texture(tNoise, uv*2.0 + time*wobbleFreq).rg - 0.5;
+          uv += n * (wobbleAmp/100.0);
+
+          vec3 col = texture(tScene, uv).rgb;
+          col = floor(col*levels)/levels;
+
+          vec2 px = 1.0 / resolution;
+          float tl=luma(texture(tScene, uv+px*vec2(-1.0,-1.0)).rgb);
+          float  t=luma(texture(tScene, uv+px*vec2( 0.0,-1.0)).rgb);
+          float tr=luma(texture(tScene, uv+px*vec2( 1.0,-1.0)).rgb);
+          float  l=luma(texture(tScene, uv+px*vec2(-1.0, 0.0)).rgb);
+          float  r=luma(texture(tScene, uv+px*vec2( 1.0, 0.0)).rgb);
+          float bl=luma(texture(tScene, uv+px*vec2(-1.0, 1.0)).rgb);
+          float  b=luma(texture(tScene, uv+px*vec2( 0.0, 1.0)).rgb);
+          float br=luma(texture(tScene, uv+px*vec2( 1.0, 1.0)).rgb);
+          float gx=(tr+2.0*r+br)-(tl+2.0*l+bl);
+          float gy=(bl+2.0*b+br)-(tl+2.0*t+tr);
+          float edge = clamp(1.0 - outlineStrength * length(vec2(gx,gy)), 0.0, 1.0);
+
+          vec3 paper = texture(tPaper, gl_FragCoord.xy/512.0 + time*0.01).rgb;
+          vec3 inked = col * mix(vec3(1.0), paper, paperMix);
+
+          gl_FragColor = vec4(inked * edge, 1.0);
+        }`
+    });
+    fsScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2,2), postMat));
+
+    // ---------- resize ----------
+    function onResize(){
+      const w=innerWidth, h=innerHeight;
+      renderer.setSize(w,h);
+      camera.aspect=w/h; camera.updateProjectionMatrix();
+
+      rt.dispose();
+      rt = new THREE.WebGLRenderTarget(w,h,{depthBuffer:true,stencilBuffer:false});
+      postMat.uniforms.tScene.value = rt.texture;
+      postMat.uniforms.resolution.value.set(w,h);
+    }
+    addEventListener('resize', onResize);
+
+    // ---------- loop ----------
+    renderer.setAnimationLoop((t)=>{
+      const time = t/1000;
+      box.rotation.y = time*0.7;
+      sphere.rotation.x = time*0.5;
+
+      hatchMat.uniforms.time.value = time;
+      postMat.uniforms.time.value = time;
+
+      controls.update();
+
+      // render scene to RT, then full-screen quad
+      renderer.setRenderTarget(rt);
+      renderer.render(scene, camera);
+      renderer.setRenderTarget(null);
+      renderer.render(fsScene, fsCam);
+    });
+  </script>
+</body>
+</html>
